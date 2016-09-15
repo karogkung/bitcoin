@@ -21,6 +21,7 @@
 #include "key.h"
 #include "main.h"
 #include "miner.h"
+#include "netbase.h"
 #include "net.h"
 #include "policy/policy.h"
 #include "rpc/server.h"
@@ -41,6 +42,7 @@
 #endif
 #include <stdint.h>
 #include <stdio.h>
+#include <memory>
 
 #ifndef WIN32
 #include <signal.h>
@@ -69,6 +71,7 @@ static const bool DEFAULT_REST_ENABLE = false;
 static const bool DEFAULT_DISABLE_SAFEMODE = false;
 static const bool DEFAULT_STOPAFTERBLOCKIMPORT = false;
 
+std::unique_ptr<CConnman> g_connman;
 
 #if ENABLE_ZMQ
 static CZMQNotificationInterface* pzmqNotificationInterface = NULL;
@@ -161,7 +164,7 @@ public:
 
 static CCoinsViewDB *pcoinsdbview = NULL;
 static CCoinsViewErrorCatcher *pcoinscatcher = NULL;
-static boost::scoped_ptr<ECCVerifyHandle> globalVerifyHandle;
+static std::unique_ptr<ECCVerifyHandle> globalVerifyHandle;
 
 void Interrupt(boost::thread_group& threadGroup)
 {
@@ -196,7 +199,9 @@ void Shutdown()
     if (pwalletMain)
         pwalletMain->Flush(false);
 #endif
-    StopNode();
+    MapPort(false);
+    g_connman.reset();
+
     StopTorControl();
     UnregisterNodeSignals(GetNodeSignals());
 
@@ -268,20 +273,26 @@ void HandleSIGHUP(int)
     fReopenDebugLog = true;
 }
 
-bool static Bind(const CService &addr, unsigned int flags) {
+bool static Bind(CConnman& connman, const CService &addr, unsigned int flags) {
     if (!(flags & BF_EXPLICIT) && IsLimited(addr))
         return false;
     std::string strError;
-    if (!BindListenPort(addr, strError, (flags & BF_WHITELIST) != 0)) {
+    if (!connman.BindListenPort(addr, strError, (flags & BF_WHITELIST) != 0)) {
         if (flags & BF_REPORT_ERROR)
             return InitError(strError);
         return false;
     }
     return true;
 }
+void OnRPCStarted()
+{
+    uiInterface.NotifyBlockTip.connect(&RPCNotifyBlockChange);
+}
 
 void OnRPCStopped()
 {
+    uiInterface.NotifyBlockTip.disconnect(&RPCNotifyBlockChange);
+    RPCNotifyBlockChange(false, nullptr);
     cvBlockChange.notify_all();
     LogPrint("rpc", "RPC stopped.\n");
 }
@@ -379,7 +390,7 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-whitelist=<netmask>", _("Whitelist peers connecting from the given netmask or IP address. Can be specified multiple times.") +
         " " + _("Whitelisted peers cannot be DoS banned and their transactions are always relayed, even if they are already in the mempool, useful e.g. for a gateway"));
     strUsage += HelpMessageOpt("-whitelistrelay", strprintf(_("Accept relayed transactions received from whitelisted peers even when not relaying transactions (default: %d)"), DEFAULT_WHITELISTRELAY));
-    strUsage += HelpMessageOpt("-whitelistforcerelay", strprintf(_("Force relay of transactions from whitelisted peers even they violate local relay policy (default: %d)"), DEFAULT_WHITELISTFORCERELAY));
+    strUsage += HelpMessageOpt("-whitelistforcerelay", strprintf(_("Force relay of transactions from whitelisted peers even if they violate local relay policy (default: %d)"), DEFAULT_WHITELISTFORCERELAY));
     strUsage += HelpMessageOpt("-maxuploadtarget=<n>", strprintf(_("Tries to keep outbound traffic under the given target (in MiB per 24h), 0 = no limit (default: %d)"), DEFAULT_MAX_UPLOAD_TARGET));
 
 #ifdef ENABLE_WALLET
@@ -482,7 +493,7 @@ std::string LicenseInfo()
 {
     const std::string URL_SOURCE_CODE = "<https://github.com/bitcoin/bitcoin>";
     const std::string URL_WEBSITE = "<https://bitcoincore.org>";
-    // todo: remove urls from translations on next change
+
     return CopyrightHolders(strprintf(_("Copyright (C) %i-%i"), 2009, COPYRIGHT_YEAR) + " ") + "\n" +
            "\n" +
            strprintf(_("Please contribute if you find %s useful. "
@@ -494,9 +505,9 @@ std::string LicenseInfo()
            "\n" +
            "\n" +
            _("This is experimental software.") + "\n" +
-           _("Distributed under the MIT software license, see the accompanying file COPYING or <http://www.opensource.org/licenses/mit-license.php>.") + "\n" +
+           strprintf(_("Distributed under the MIT software license, see the accompanying file %s or %s"), "COPYING", "<https://opensource.org/licenses/MIT>") + "\n" +
            "\n" +
-           _("This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit <https://www.openssl.org/> and cryptographic software written by Eric Young and UPnP software written by Thomas Bernard.") +
+           strprintf(_("This product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit %s and cryptographic software written by Eric Young and UPnP software written by Thomas Bernard."), "<https://www.openssl.org>") +
            "\n";
 }
 
@@ -665,6 +676,7 @@ bool InitSanityCheck(void)
 
 bool AppInitServers(boost::thread_group& threadGroup)
 {
+    RPCServer::OnStarted(&OnRPCStarted);
     RPCServer::OnStopped(&OnRPCStopped);
     RPCServer::OnPreCommand(&OnRPCPreCommand);
     if (!InitHTTPServer())
@@ -856,7 +868,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     // Make sure enough file descriptors are available
     int nBind = std::max((int)mapArgs.count("-bind") + (int)mapArgs.count("-whitebind"), 1);
     int nUserMaxConnections = GetArg("-maxconnections", DEFAULT_MAX_PEER_CONNECTIONS);
-    nMaxConnections = std::max(nUserMaxConnections, 0);
+    int nMaxConnections = std::max(nUserMaxConnections, 0);
 
     // Trim requested connection counts, to fit into system limitations
     nMaxConnections = std::max(std::min(nMaxConnections, (int)(FD_SETSIZE - nBind - MIN_CORE_FILEDESCRIPTORS)), 0);
@@ -977,6 +989,9 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     // Option to startup with mocktime set (used for regression testing):
     SetMockTime(GetArg("-mocktime", 0)); // SetMockTime(0) is a no-op
 
+    ServiceFlags nLocalServices = NODE_NETWORK;
+    ServiceFlags nRelevantServices = NODE_NETWORK;
+
     if (GetBoolArg("-peerbloomfilters", DEFAULT_PEERBLOOMFILTERS))
         nLocalServices = ServiceFlags(nLocalServices | NODE_BLOOM);
 
@@ -1066,7 +1081,6 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     LogPrintf("Using data directory %s\n", strDataDir);
     LogPrintf("Using config file %s\n", GetConfigFile().string());
     LogPrintf("Using at most %i connections (%i file descriptors available)\n", nMaxConnections, nFD);
-    std::ostringstream strErrors;
 
     LogPrintf("Using %u threads for script verification\n", nScriptCheckThreads);
     if (nScriptCheckThreads) {
@@ -1101,6 +1115,10 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 #endif // ENABLE_WALLET
     // ********************************************************* Step 6: network initialization
 
+    assert(!g_connman);
+    g_connman = std::unique_ptr<CConnman>(new CConnman());
+    CConnman& connman = *g_connman;
+
     RegisterNodeSignals(GetNodeSignals());
 
     // sanitize comments per BIP-0014, format user agent and check total size
@@ -1134,10 +1152,11 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 
     if (mapArgs.count("-whitelist")) {
         BOOST_FOREACH(const std::string& net, mapMultiArgs["-whitelist"]) {
-            CSubNet subnet(net);
+            CSubNet subnet;
+            LookupSubNet(net.c_str(), subnet);
             if (!subnet.IsValid())
                 return InitError(strprintf(_("Invalid netmask specified in -whitelist: '%s'"), net));
-            CNode::AddWhitelistedRange(subnet);
+            connman.AddWhitelistedRange(subnet);
         }
     }
 
@@ -1147,7 +1166,8 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     std::string proxyArg = GetArg("-proxy", "");
     SetLimited(NET_TOR);
     if (proxyArg != "" && proxyArg != "0") {
-        proxyType addrProxy = proxyType(CService(proxyArg, 9050), proxyRandomize);
+        CService resolved(LookupNumeric(proxyArg.c_str(), 9050));
+        proxyType addrProxy = proxyType(resolved, proxyRandomize);
         if (!addrProxy.IsValid())
             return InitError(strprintf(_("Invalid -proxy address: '%s'"), proxyArg));
 
@@ -1166,7 +1186,8 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
         if (onionArg == "0") { // Handle -noonion/-onion=0
             SetLimited(NET_TOR); // set onions as unreachable
         } else {
-            proxyType addrOnion = proxyType(CService(onionArg, 9050), proxyRandomize);
+            CService resolved(LookupNumeric(onionArg.c_str(), 9050));
+            proxyType addrOnion = proxyType(resolved, proxyRandomize);
             if (!addrOnion.IsValid())
                 return InitError(strprintf(_("Invalid -onion address: '%s'"), onionArg));
             SetProxy(NET_TOR, addrOnion);
@@ -1180,14 +1201,14 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     fNameLookup = GetBoolArg("-dns", DEFAULT_NAME_LOOKUP);
     fRelayTxes = !GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY);
 
-    bool fBound = false;
     if (fListen) {
+        bool fBound = false;
         if (mapArgs.count("-bind") || mapArgs.count("-whitebind")) {
             BOOST_FOREACH(const std::string& strBind, mapMultiArgs["-bind"]) {
                 CService addrBind;
                 if (!Lookup(strBind.c_str(), addrBind, GetListenPort(), false))
                     return InitError(ResolveErrMsg("bind", strBind));
-                fBound |= Bind(addrBind, (BF_EXPLICIT | BF_REPORT_ERROR));
+                fBound |= Bind(connman, addrBind, (BF_EXPLICIT | BF_REPORT_ERROR));
             }
             BOOST_FOREACH(const std::string& strBind, mapMultiArgs["-whitebind"]) {
                 CService addrBind;
@@ -1195,14 +1216,14 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                     return InitError(ResolveErrMsg("whitebind", strBind));
                 if (addrBind.GetPort() == 0)
                     return InitError(strprintf(_("Need to specify a port with -whitebind: '%s'"), strBind));
-                fBound |= Bind(addrBind, (BF_EXPLICIT | BF_REPORT_ERROR | BF_WHITELIST));
+                fBound |= Bind(connman, addrBind, (BF_EXPLICIT | BF_REPORT_ERROR | BF_WHITELIST));
             }
         }
         else {
             struct in_addr inaddr_any;
             inaddr_any.s_addr = INADDR_ANY;
-            fBound |= Bind(CService(in6addr_any, GetListenPort()), BF_NONE);
-            fBound |= Bind(CService(inaddr_any, GetListenPort()), !fBound ? BF_REPORT_ERROR : BF_NONE);
+            fBound |= Bind(connman, CService(in6addr_any, GetListenPort()), BF_NONE);
+            fBound |= Bind(connman, CService(inaddr_any, GetListenPort()), !fBound ? BF_REPORT_ERROR : BF_NONE);
         }
         if (!fBound)
             return InitError(_("Failed to listen on any port. Use -listen=0 if you want this."));
@@ -1219,7 +1240,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 
     BOOST_FOREACH(const std::string& strDest, mapMultiArgs["-seednode"])
-        AddOneShot(strDest);
+        connman.AddOneShot(strDest);
 
 #if ENABLE_ZMQ
     pzmqNotificationInterface = CZMQNotificationInterface::CreateWithArguments(mapArgs);
@@ -1229,7 +1250,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
 #endif
     if (mapArgs.count("-maxuploadtarget")) {
-        CNode::SetMaxOutboundTarget(GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET)*1024*1024);
+        connman.SetMaxOutboundTarget(GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET)*1024*1024);
     }
 
     // ********************************************************* Step 7: load block chain
@@ -1267,7 +1288,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     // cache size calculations
     int64_t nTotalCache = (GetArg("-dbcache", nDefaultDbCache) << 20);
     nTotalCache = std::max(nTotalCache, nMinDbCache << 20); // total cache cannot be less than nMinDbCache
-    nTotalCache = std::min(nTotalCache, nMaxDbCache << 20); // total cache cannot be greated than nMaxDbcache
+    nTotalCache = std::min(nTotalCache, nMaxDbCache << 20); // total cache cannot be greater than nMaxDbcache
     int64_t nBlockTreeDBCache = nTotalCache / 8;
     nBlockTreeDBCache = std::min(nBlockTreeDBCache, (GetBoolArg("-txindex", DEFAULT_TXINDEX) ? nMaxBlockDBAndTxIndexCache : nMaxBlockDBCache) << 20);
     nTotalCache -= nBlockTreeDBCache;
@@ -1354,6 +1375,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
                 {
                     LOCK(cs_main);
                     CBlockIndex* tip = chainActive.Tip();
+                    RPCNotifyBlockChange(true, tip);
                     if (tip && tip->nTime > GetAdjustedTime() + 2 * 60 * 60) {
                         strLoadError = _("The block database contains a block which appears to be from the future. "
                                 "This may be due to your computer's date and time being set incorrectly. "
@@ -1488,22 +1510,31 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 
     // ********************************************************* Step 11: start node
 
-    if (!strErrors.str().empty())
-        return InitError(strErrors.str());
-
     //// debug print
     LogPrintf("mapBlockIndex.size() = %u\n",   mapBlockIndex.size());
     LogPrintf("nBestHeight = %d\n",                   chainActive.Height());
-#ifdef ENABLE_WALLET
-    LogPrintf("setKeyPool.size() = %u\n",      pwalletMain ? pwalletMain->setKeyPool.size() : 0);
-    LogPrintf("mapWallet.size() = %u\n",       pwalletMain ? pwalletMain->mapWallet.size() : 0);
-    LogPrintf("mapAddressBook.size() = %u\n",  pwalletMain ? pwalletMain->mapAddressBook.size() : 0);
-#endif
-
     if (GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION))
         StartTorControl(threadGroup, scheduler);
 
-    StartNode(threadGroup, scheduler);
+    Discover(threadGroup);
+
+    // Map ports with UPnP
+    MapPort(GetBoolArg("-upnp", DEFAULT_UPNP));
+
+    std::string strNodeError;
+    CConnman::Options connOptions;
+    connOptions.nLocalServices = nLocalServices;
+    connOptions.nRelevantServices = nRelevantServices;
+    connOptions.nMaxConnections = nMaxConnections;
+    connOptions.nMaxOutbound = std::min(MAX_OUTBOUND_CONNECTIONS, connOptions.nMaxConnections);
+    connOptions.nMaxFeeler = 1;
+    connOptions.nBestHeight = chainActive.Height();
+    connOptions.uiInterface = &uiInterface;
+    connOptions.nSendBufferMaxSize = 1000*GetArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
+    connOptions.nReceiveFloodSize = 1000*GetArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
+
+    if(!connman.Start(threadGroup, scheduler, strNodeError, connOptions))
+        return InitError(strNodeError);
 
     // ********************************************************* Step 12: finished
 
@@ -1512,9 +1543,6 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
 
 #ifdef ENABLE_WALLET
     if (pwalletMain) {
-        // Add wallet transactions that aren't already in a block to mapTransactions
-        pwalletMain->ReacceptWalletTransactions();
-
         // Run a thread to flush wallet periodically
         threadGroup.create_thread(boost::bind(&ThreadFlushWalletDB, boost::ref(pwalletMain->strWalletFile)));
     }
